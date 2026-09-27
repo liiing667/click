@@ -387,28 +387,56 @@ class _OptionParser:
 
         option.process(value, state)
 
-    def _match_short_opt(self, arg: str, state: _ParsingState) -> None:
-        stop = False
-        i = 1
+    def _split_short_opts(
+        self, arg: str
+    ) -> cabc.Iterator[tuple[str, str, _Option | None, str | None]]:
+        """Decompose a short option cluster into its individual options.
+
+        Purely syntactic: no parsing state is read or modified. Yields
+        ``(ch, opt, option, attached)`` for each character, where ``ch`` is
+        the raw character, ``opt`` the normalized option name, ``option``
+        the registered option or ``None`` if unknown, and ``attached`` the
+        remainder of the cluster if the option takes a value.
+        """
         prefix = arg[0]
-        unknown_options = []
+        i = 1
 
         for ch in arg[1:]:
             opt = _normalize_opt(f"{prefix}{ch}", self.ctx)
             option = self._short_opt.get(opt)
             i += 1
 
-            if not option:
+            if option is None:
+                yield ch, opt, None, None
+                continue
+
+            attached = None
+            if option.takes_value and i < len(arg):
+                # Any characters left in arg are the option's value, and
+                # the cluster ends here.
+                attached = arg[i:]
+
+            yield ch, opt, option, attached
+
+            if attached is not None:
+                return
+
+    def _match_short_opt(self, arg: str, state: _ParsingState) -> None:
+        prefix = arg[0]
+        unknown_options = []
+
+        for ch, opt, option, attached in self._split_short_opts(arg):
+            if option is None:
                 if self.ignore_unknown_options:
                     unknown_options.append(ch)
                     continue
                 raise NoSuchOption(opt, ctx=self.ctx)
+
             if option.takes_value:
-                # Any characters left in arg?  Pretend they're the
-                # next arg, and stop consuming characters of arg.
-                if i < len(arg):
-                    state.rargs.insert(0, arg[i:])
-                    stop = True
+                # Pretend the attached characters are the next arg, so the
+                # value is consumed from the state like any other value.
+                if attached is not None:
+                    state.rargs.insert(0, attached)
 
                 value = self._get_value_from_state(opt, option, state)
 
@@ -416,9 +444,6 @@ class _OptionParser:
                 value = UNSET
 
             option.process(value, state)
-
-            if stop:
-                break
 
         # If we got any unknown options we recombine the string of the
         # remaining options and re-attach the prefix, then report that
@@ -468,15 +493,7 @@ class _OptionParser:
         return value
 
     def _process_opts(self, arg: str, state: _ParsingState) -> None:
-        explicit_value = None
-        # Long option handling happens in two parts.  The first part is
-        # supporting explicitly attached values.  In any case, we will try
-        # to long match the option first.
-        if "=" in arg:
-            long_opt, explicit_value = arg.split("=", 1)
-        else:
-            long_opt = arg
-        norm_long_opt = _normalize_opt(long_opt, self.ctx)
+        norm_long_opt, explicit_value = self._split_long_opt(arg)
 
         # At this point we will match the (assumed) long option through
         # the long option matching code.  Note that this allows options
@@ -498,6 +515,19 @@ class _OptionParser:
                 raise
 
             state.largs.append(arg)
+
+    def _split_long_opt(self, arg: str) -> tuple[str, str | None]:
+        """Split a long option into its normalized name and the explicitly
+        attached value (``--opt=value``), or ``None`` if there is none.
+
+        Purely syntactic: no parsing state is read or modified.
+        """
+        if "=" in arg:
+            long_opt, explicit_value = arg.split("=", 1)
+        else:
+            long_opt, explicit_value = arg, None
+
+        return _normalize_opt(long_opt, self.ctx), explicit_value
 
 
 def __getattr__(name: str) -> object:

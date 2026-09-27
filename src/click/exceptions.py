@@ -143,12 +143,20 @@ class BadParameter(UsageError):
         self.param = param
         self.param_hint = param_hint
 
-    def format_message(self) -> str:
+    def _get_param_hint(self) -> cabc.Sequence[str] | str | None:
+        """The explicit hint if given, otherwise derived from the parameter."""
         if self.param_hint is not None:
-            param_hint = self.param_hint
-        elif self.param is not None:
-            param_hint = self.param.get_error_hint(self.ctx)
-        else:
+            return self.param_hint
+
+        if self.param is not None:
+            return self.param.get_error_hint(self.ctx)
+
+        return None
+
+    def format_message(self) -> str:
+        param_hint = self._get_param_hint()
+
+        if param_hint is None:
             return _("Invalid value: {message}").format(message=self.message)
 
         return _("Invalid value for {param_hint}: {message}").format(
@@ -182,14 +190,7 @@ class MissingParameter(BadParameter):
         self.param_type = param_type
 
     def format_message(self) -> str:
-        if self.param_hint is not None:
-            param_hint: cabc.Sequence[str] | str | None = self.param_hint
-        elif self.param is not None:
-            param_hint = self.param.get_error_hint(self.ctx)
-        else:
-            param_hint = None
-
-        param_hint = _join_param_hints(param_hint)
+        param_hint = _join_param_hints(self._get_param_hint())
         param_hint = f" {param_hint}" if param_hint else ""
 
         param_type = self.param_type

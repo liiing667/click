@@ -14,6 +14,7 @@ from collections import Counter
 from contextlib import AbstractContextManager
 from contextlib import contextmanager
 from contextlib import ExitStack
+from functools import partial
 from functools import update_wrapper
 from gettext import gettext as _
 from gettext import ngettext
@@ -229,6 +230,106 @@ class ParameterSource(enum.IntEnum):
     """Used a default provided by :attr:`Context.default_map`."""
     DEFAULT = enum.auto()
     """Used the default specified by the parameter."""
+
+
+def _resolve_value_and_source(
+    cli_value: t.Any,
+    envvar_value: cabc.Callable[[], t.Any | None],
+    default_map_value: cabc.Callable[[], tuple[bool, t.Any]],
+    param_default: cabc.Callable[[], t.Any],
+) -> tuple[t.Any, ParameterSource]:
+    """Decide which source provides a parameter's value.
+
+    Precedence is command line, then environment variable, then
+    :attr:`Context.default_map`, then the parameter's default. Suppliers are
+    only called when no higher-precedence source produced a value, so
+    fetching a value (reading the environment, calling a callable default)
+    never happens for a source that would lose anyway.
+
+    :param cli_value: The value produced by the parser, or :data:`UNSET` if
+        the parameter was not given on the command line.
+    :param envvar_value: Returns the value from the environment, or ``None``
+        if no environment variable is set.
+    :param default_map_value: Returns ``(has_value, value)`` for the
+        ``default_map`` lookup. ``has_value`` distinguishes an absent key
+        from a key explicitly set to ``None``.
+    :param param_default: Returns the parameter's default, or :data:`UNSET`
+        if it has none.
+
+    :meta private:
+    """
+    if cli_value is not UNSET:
+        return cli_value, ParameterSource.COMMANDLINE
+
+    value = envvar_value()
+    if value is not None:
+        return value, ParameterSource.ENVIRONMENT
+
+    has_default_map_value, value = default_map_value()
+    if has_default_map_value:
+        return value, ParameterSource.DEFAULT_MAP
+
+    value = param_default()
+    if value is not UNSET:
+        return value, ParameterSource.DEFAULT
+
+    return UNSET, ParameterSource.DEFAULT
+
+
+def _resolve_option_value_and_source(
+    value: t.Any,
+    source: ParameterSource,
+    *,
+    flag_activation_value: t.Any,
+    multiple: bool,
+    prompt_value: cabc.Callable[[], t.Any] | None,
+    prompt_on_default: bool,
+) -> tuple[t.Any, ParameterSource]:
+    """Resolve option-specific value and source adjustments.
+
+    Handles the :data:`FLAG_NEEDS_VALUE` sentinel emitted by the parser when
+    a flag may be used without a value, and the interactive prompt for
+    options that require a value but did not get one from an explicit source.
+
+    :param value: The value produced by :func:`_resolve_value_and_source`.
+    :param source: The source of that value.
+    :param flag_activation_value: The value a flag takes when activated
+        without an explicit value.
+    :param multiple: Whether the option can be given multiple times.
+    :param prompt_value: Starts the interactive prompt, or ``None`` if
+        prompting is disabled for this option or context.
+    :param prompt_on_default: Whether a value coming from a default source
+        should trigger the prompt.
+
+    :meta private:
+    """
+    if value is FLAG_NEEDS_VALUE:
+        if prompt_value is not None:
+            return prompt_value(), ParameterSource.PROMPT
+
+        return flag_activation_value, ParameterSource.COMMANDLINE
+
+    if (
+        multiple
+        and value is not UNSET
+        and isinstance(value, cabc.Iterable)
+        and source < ParameterSource.DEFAULT_MAP
+        and any(item is FLAG_NEEDS_VALUE for item in value)
+    ):
+        value = [
+            flag_activation_value if item is FLAG_NEEDS_VALUE else item
+            for item in value
+        ]
+        return value, ParameterSource.COMMANDLINE
+
+    if (
+        prompt_value is not None
+        and prompt_on_default
+        and (value is UNSET or source >= ParameterSource.DEFAULT_MAP)
+    ):
+        return prompt_value(), ParameterSource.PROMPT
+
+    return value, source
 
 
 class Context:
@@ -2596,40 +2697,30 @@ class Parameter(ABC):
 
         :meta private:
         """
-        # Collect from the parse the value passed by the user to the CLI.
-        value = opts.get(self.name, UNSET)
-        # If the value is set, it means it was sourced from the command line by the
-        # parser, otherwise it left unset by default.
-        source = (
-            ParameterSource.COMMANDLINE
-            if value is not UNSET
-            else ParameterSource.DEFAULT
+        # The value passed by the user on the command line, collected from
+        # the parse. UNSET if the parser did not see the parameter.
+        cli_value = opts.get(self.name, UNSET)
+
+        def default_map_value() -> tuple[bool, t.Any]:
+            value = ctx.lookup_default(self.name)
+            if value is None and not ctx._default_map_has(self.name):
+                return False, UNSET
+
+            # A string from default_map must be split for multi-value
+            # parameters, matching value_from_envvar behavior.
+            if isinstance(value, str) and self.nargs != 1:
+                value = self.type.split_envvar_value(value)
+
+            return True, value
+
+        # Which source wins is decided by _resolve_value_and_source; this
+        # method only fetches each candidate value.
+        return _resolve_value_and_source(
+            cli_value,
+            lambda: self.value_from_envvar(ctx),
+            default_map_value,
+            lambda: self.get_default(ctx),
         )
-
-        if value is UNSET:
-            envvar_value = self.value_from_envvar(ctx)
-            if envvar_value is not None:
-                value = envvar_value
-                source = ParameterSource.ENVIRONMENT
-
-        if value is UNSET:
-            default_map_value = ctx.lookup_default(self.name)
-            if default_map_value is not None or ctx._default_map_has(self.name):
-                value = default_map_value
-                source = ParameterSource.DEFAULT_MAP
-
-                # A string from default_map must be split for multi-value
-                # parameters, matching value_from_envvar behavior.
-                if isinstance(value, str) and self.nargs != 1:
-                    value = self.type.split_envvar_value(value)
-
-        if value is UNSET:
-            default_value = self.get_default(ctx)
-            if default_value is not UNSET:
-                value = default_value
-                source = ParameterSource.DEFAULT
-
-        return value, source
 
     def type_cast_value(self, ctx: Context, value: t.Any) -> t.Any:
         """Convert and validate a value against the parameter's
@@ -3737,47 +3828,20 @@ class Option(Parameter):
         """
         value, source = super().consume_value(ctx, opts)
 
-        # The parser emits a sentinel when a flag is allowed to be used without a value.
-        # Resolve it to a prompt or to the activation value depending on the option's
-        # configuration.
-        if value is FLAG_NEEDS_VALUE:
-            # If the option allows for a prompt, start an interaction with the user.
-            if self.prompt is not None and not ctx.resilient_parsing:
-                value = self.prompt_for_value(ctx)
-                source = ParameterSource.PROMPT
-            # Else the flag takes its activation value (resolves UNSET).
-            else:
-                value = self.flag_activation_value
-                source = ParameterSource.COMMANDLINE
+        # Prompting is only possible if the option declares a prompt and the
+        # context allows user interaction.
+        prompt_value: cabc.Callable[[], t.Any] | None = None
+        if self.prompt is not None and not ctx.resilient_parsing:
+            prompt_value = partial(self.prompt_for_value, ctx)
 
-        # Re-interpret a multiple option that the parser sent through as a list still
-        # containing the FLAG_NEEDS_VALUE sentinel, replacing each occurrence with the
-        # activation value.
-        elif (
-            self.multiple
-            and value is not UNSET
-            and isinstance(value, cabc.Iterable)
-            and source < ParameterSource.DEFAULT_MAP
-            and any(v is FLAG_NEEDS_VALUE for v in value)
-        ):
-            value = [
-                self.flag_activation_value if v is FLAG_NEEDS_VALUE else v
-                for v in value
-            ]
-            source = ParameterSource.COMMANDLINE
-
-        # The value wasn't set, or used the param's default, prompt for one to the user
-        # if prompting is enabled.
-        elif (
-            (value is UNSET or source >= ParameterSource.DEFAULT_MAP)
-            and self.prompt is not None
-            and (self.required or self.prompt_required)
-            and not ctx.resilient_parsing
-        ):
-            value = self.prompt_for_value(ctx)
-            source = ParameterSource.PROMPT
-
-        return value, source
+        return _resolve_option_value_and_source(
+            value,
+            source,
+            flag_activation_value=self.flag_activation_value,
+            multiple=self.multiple,
+            prompt_value=prompt_value,
+            prompt_on_default=self.required or self.prompt_required,
+        )
 
     def process_value(self, ctx: Context, value: t.Any) -> t.Any:
         # process_value has to be overridden on Options in order to capture
