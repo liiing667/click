@@ -2,6 +2,10 @@
 
 Unreleased
 
+- The decision of where a parameter's value comes from is centralized in a
+  new private ``click._sources`` module, so it can be tested on its own.
+  ``ParameterSource`` is still exported from ``click`` and ``click.core``,
+  and parsing, prompting, and source precedence are unchanged.
 - A parameter name that is not a valid Python identifier, or that is a Python
   keyword, is deprecated and raises `TypeError` in Click 9.0. {pr}`3866`
 - An {class}`Option` name written as a Python identifier is deprecated when it

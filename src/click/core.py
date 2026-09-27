@@ -22,6 +22,8 @@ from types import FrameType
 from types import TracebackType
 
 from . import types
+from ._sources import ParameterSource
+from ._sources import resolve_value_and_source
 from ._utils import FLAG_NEEDS_VALUE
 from ._utils import UNSET
 from .exceptions import Abort
@@ -190,45 +192,6 @@ def iter_params_for_processing(
         return not item.is_eager, idx
 
     return sorted(declaration_order, key=sort_key)
-
-
-class ParameterSource(enum.IntEnum):
-    """This is an :class:`~enum.IntEnum` that indicates the source of a
-    parameter's value.
-
-    Use :meth:`click.Context.get_parameter_source` to get the
-    source for a parameter by name.
-
-    Members are ordered from most explicit to least explicit source.
-    This allows comparison to check if a value was explicitly provided:
-
-    .. code-block:: python
-
-        source = ctx.get_parameter_source("port")
-        if source < click.ParameterSource.DEFAULT_MAP:
-            ...  # value was explicitly set
-
-    .. versionchanged:: 8.3.3
-        Use :class:`~enum.IntEnum` and reorder members from most to
-        least explicit. Supports comparison operators.
-
-    .. versionchanged:: 8.0
-        Use :class:`~enum.Enum` and drop the ``validate`` method.
-
-    .. versionchanged:: 8.0
-        Added the ``PROMPT`` value.
-    """
-
-    PROMPT = enum.auto()
-    """Used a prompt to confirm a default or provide a value."""
-    COMMANDLINE = enum.auto()
-    """The value was provided by the command line args."""
-    ENVIRONMENT = enum.auto()
-    """The value was provided with an environment variable."""
-    DEFAULT_MAP = enum.auto()
-    """Used a default provided by :attr:`Context.default_map`."""
-    DEFAULT = enum.auto()
-    """Used the default specified by the parameter."""
 
 
 class Context:
@@ -2594,42 +2557,13 @@ class Parameter(ABC):
 
         If no value is found, an internal sentinel value is returned.
 
+        The source precedence itself lives in
+        :func:`~click._sources.resolve_value_and_source`, so that it can be
+        tested independently of the parameter machinery.
+
         :meta private:
         """
-        # Collect from the parse the value passed by the user to the CLI.
-        value = opts.get(self.name, UNSET)
-        # If the value is set, it means it was sourced from the command line by the
-        # parser, otherwise it left unset by default.
-        source = (
-            ParameterSource.COMMANDLINE
-            if value is not UNSET
-            else ParameterSource.DEFAULT
-        )
-
-        if value is UNSET:
-            envvar_value = self.value_from_envvar(ctx)
-            if envvar_value is not None:
-                value = envvar_value
-                source = ParameterSource.ENVIRONMENT
-
-        if value is UNSET:
-            default_map_value = ctx.lookup_default(self.name)
-            if default_map_value is not None or ctx._default_map_has(self.name):
-                value = default_map_value
-                source = ParameterSource.DEFAULT_MAP
-
-                # A string from default_map must be split for multi-value
-                # parameters, matching value_from_envvar behavior.
-                if isinstance(value, str) and self.nargs != 1:
-                    value = self.type.split_envvar_value(value)
-
-        if value is UNSET:
-            default_value = self.get_default(ctx)
-            if default_value is not UNSET:
-                value = default_value
-                source = ParameterSource.DEFAULT
-
-        return value, source
+        return resolve_value_and_source(self, ctx, opts)
 
     def type_cast_value(self, ctx: Context, value: t.Any) -> t.Any:
         """Convert and validate a value against the parameter's

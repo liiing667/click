@@ -117,11 +117,37 @@ def _split_opt(opt: str) -> tuple[str, str]:
     return first, opt[1:]
 
 
+def _split_long_opt(opt: str) -> tuple[str, str | None]:
+    """Split an option token into a name and an inline ``=`` value.
+
+    Purely syntactic: ``"--foo=bar"`` becomes ``("--foo", "bar")`` and a
+    token without ``=`` gets a ``None`` value.
+    """
+    name, sep, value = opt.partition("=")
+    if not sep:
+        return opt, None
+    return name, value
+
+
 def _normalize_opt(opt: str, ctx: Context | None) -> str:
     if ctx is None or ctx.token_normalize_func is None:
         return opt
     prefix, opt = _split_opt(opt)
     return f"{prefix}{ctx.token_normalize_func(opt)}"
+
+
+class _ShortOptToken(t.NamedTuple):
+    """One option extracted from a short-option token such as ``-aboval``.
+
+    ``option`` is ``None`` for a character that does not match a known
+    option (only possible when unknown options are ignored). ``char`` is
+    the raw character, kept so unknown options can be recombined.
+    """
+
+    name: str
+    option: _Option | None
+    inline_value: str | None
+    char: str
 
 
 class _Option:
@@ -388,44 +414,75 @@ class _OptionParser:
         option.process(value, state)
 
     def _match_short_opt(self, arg: str, state: _ParsingState) -> None:
-        stop = False
-        i = 1
         prefix = arg[0]
-        unknown_options = []
+        unknown_chars: list[str] = []
 
-        for ch in arg[1:]:
-            opt = _normalize_opt(f"{prefix}{ch}", self.ctx)
-            option = self._short_opt.get(opt)
-            i += 1
+        for token in self._tokenize_short_opts(arg):
+            option = token.option
 
-            if not option:
-                if self.ignore_unknown_options:
-                    unknown_options.append(ch)
-                    continue
-                raise NoSuchOption(opt, ctx=self.ctx)
+            if option is None:
+                unknown_chars.append(token.char)
+                continue
+
             if option.takes_value:
-                # Any characters left in arg?  Pretend they're the
-                # next arg, and stop consuming characters of arg.
-                if i < len(arg):
-                    state.rargs.insert(0, arg[i:])
-                    stop = True
+                # Any characters left in the token?  Pretend they're the
+                # next arg, and stop consuming characters of the token.
+                if token.inline_value is not None:
+                    state.rargs.insert(0, token.inline_value)
 
-                value = self._get_value_from_state(opt, option, state)
+                value = self._get_value_from_state(token.name, option, state)
 
             else:
                 value = UNSET
 
             option.process(value, state)
 
-            if stop:
+            if token.inline_value is not None:
                 break
 
         # If we got any unknown options we recombine the string of the
         # remaining options and re-attach the prefix, then report that
         # to the state as new large.  This way there is basic combinatorics
         # that can be achieved while still ignoring unknown arguments.
-        if self.ignore_unknown_options and unknown_options:
-            state.largs.append(f"{prefix}{''.join(unknown_options)}")
+        if self.ignore_unknown_options and unknown_chars:
+            state.largs.append(f"{prefix}{''.join(unknown_chars)}")
+
+    def _tokenize_short_opts(self, arg: str) -> cabc.Iterator[_ShortOptToken]:
+        """Split a short-option token into its individual options.
+
+        Purely syntactic: this never consumes values from the parsing
+        state. An option that takes a value swallows the rest of the token
+        as an inline value (``-ovalue``), which ends the token.
+        """
+        prefix = arg[0]
+        index = 1
+
+        while index < len(arg):
+            char = arg[index]
+            name = _normalize_opt(f"{prefix}{char}", self.ctx)
+            option = self._short_opt.get(name)
+            index += 1
+
+            if option is None:
+                if not self.ignore_unknown_options:
+                    raise NoSuchOption(name, ctx=self.ctx)
+
+                yield _ShortOptToken(
+                    name=name, option=None, inline_value=None, char=char
+                )
+                continue
+
+            inline_value = None
+
+            if option.takes_value and index < len(arg):
+                inline_value = arg[index:]
+
+            yield _ShortOptToken(
+                name=name, option=option, inline_value=inline_value, char=char
+            )
+
+            if inline_value is not None:
+                return
 
     def _get_value_from_state(
         self, option_name: str, option: _Option, state: _ParsingState
@@ -468,14 +525,10 @@ class _OptionParser:
         return value
 
     def _process_opts(self, arg: str, state: _ParsingState) -> None:
-        explicit_value = None
         # Long option handling happens in two parts.  The first part is
-        # supporting explicitly attached values.  In any case, we will try
-        # to long match the option first.
-        if "=" in arg:
-            long_opt, explicit_value = arg.split("=", 1)
-        else:
-            long_opt = arg
+        # purely syntactic: splitting off an explicitly attached value.  In
+        # any case, we will try to long match the option first.
+        long_opt, explicit_value = _split_long_opt(arg)
         norm_long_opt = _normalize_opt(long_opt, self.ctx)
 
         # At this point we will match the (assumed) long option through
